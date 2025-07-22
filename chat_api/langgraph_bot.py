@@ -1,36 +1,46 @@
 import os
-import json
+
 from dotenv import load_dotenv
 from typing import Annotated
 from typing_extensions import TypedDict
+
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
+
 from langchain_community.vectorstores import FAISS
-from langchain_aws.embeddings import BedrockEmbeddings
-from langchain_aws.chat_models import ChatBedrock
+from langchain_huggingface.embeddings import HuggingFaceEmbeddings
 from langchain_core.prompts import PromptTemplate
+
+from huggingface_hub import InferenceClient
 
 # ------------------ Load environment variables ------------------
 load_dotenv()
+HF_TOKEN = os.getenv("HUGGINGFACE_HUB_TOKEN")
 
-# ------------------ FAISS Vector Store ------------------
-embeddings = BedrockEmbeddings(
-    model_id="amazon.titan-embed-text-v1",
-    region_name=os.getenv("AWS_DEFAULT_REGION", "us-east-1")
-)
+# ------------------ Load FAISS Vectorstore ------------------
+embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 vectorstore = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
 retriever = vectorstore.as_retriever()
 
-# ------------------ LLM Setup ------------------
-llm = ChatBedrock(
-    model_id="anthropic.claude-3-sonnet-20240229-v1:0",
-    region_name=os.getenv("AWS_DEFAULT_REGION", "us-east-1")
-)
+# ------------------ Hugging Face Chat Model ------------------
+client = InferenceClient("HuggingFaceH4/zephyr-7b-beta", token=HF_TOKEN)
 
+def hf_llm_chat(prompt: str) -> str:
+    try:
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": prompt}
+        ]
+        response = client.chat_completion(messages=messages, max_tokens=512)
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        print(" HF Error:", e)
+        return "Error generating response."
+
+# ------------------ Prompt Template ------------------
 prompt_template = PromptTemplate(
     input_variables=["context", "question"],
-    template="""
-You are a helpful assistant. Use the following context to answer the question clearly.
+    template="""You are a helpful assistant. Use the following context to answer the question clearly.
 
 Context:
 {context}
@@ -38,8 +48,7 @@ Context:
 Question:
 {question}
 
-Answer:
-"""
+Answer:"""  # <- Ensures model doesn't echo back prompt
 )
 
 # ------------------ LangGraph State ------------------
@@ -61,8 +70,10 @@ def retrieve_node(state: GraphState) -> GraphState:
 
 def generate_node(state: GraphState) -> GraphState:
     prompt = prompt_template.format(context=state["context"], question=state["question"])
-    response = llm.invoke(prompt)
-    return {**state, "answer": response.content}
+    print(" Prompt to HF:\n", prompt)
+    response = hf_llm_chat(prompt)
+    print(" HF Response:\n", response)
+    return {**state, "answer": response or "No response."}
 
 def response_node(state: GraphState) -> GraphState:
     return {
@@ -86,7 +97,8 @@ builder.add_edge("response_node", END)
 
 graph = builder.compile()
 
-# ------------------ Callable Function for DRF ------------------
+
+# ------------------ Callable Function ------------------
 def process_user_query(user_input: str) -> dict:
     state = {
         "messages": [{"role": "user", "content": user_input}],
